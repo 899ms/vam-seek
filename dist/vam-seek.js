@@ -1,7 +1,7 @@
 /**
  * VAM Seek - 2D Video Seek Marker Library
  *
- * @version 1.3.6
+ * @version 1.4.0
  * @license See LICENSE (CC BY-NC 4.0 based)
  * @author Susumu Takahashi (unhaya) - https://github.com/unhaya
  *
@@ -22,15 +22,13 @@
     'use strict';
 
     // ==========================================
-    // Multi-Video LRU Cache Manager (up to 5 videos, max 500 frames per video)
+    // Multi-Video LRU Cache Manager (up to 5 videos, unlimited frames per video)
     // ==========================================
     class MultiVideoCache {
-        constructor(maxVideos = 5, maxFramesPerVideo = 500) {
+        constructor(maxVideos = 5) {
             this.maxVideos = maxVideos;
-            this.maxFramesPerVideo = maxFramesPerVideo;
             this.videoOrder = []; // LRU order
             this.caches = new Map(); // videoSrc -> FrameCache (Map)
-            this.frameOrder = new Map(); // videoSrc -> Array of timestamp keys (LRU order)
         }
 
         _getOrCreateCache(videoSrc) {
@@ -48,10 +46,8 @@
                         }
                     }
                     this.caches.delete(oldest);
-                    this.frameOrder.delete(oldest);
                 }
                 this.caches.set(videoSrc, new Map());
-                this.frameOrder.set(videoSrc, []);
                 this.videoOrder.push(videoSrc);
             } else {
                 // Move to end (most recently used)
@@ -74,33 +70,14 @@
         put(videoSrc, timestamp, imageData) {
             const cache = this._getOrCreateCache(videoSrc);
             const key = timestamp.toFixed(2);
-            const order = this.frameOrder.get(videoSrc);
-
             if (cache.has(key)) {
                 // Revoke old blob URL before replacing
                 const old = cache.get(key);
                 if (old && old.blobUrl) {
                     URL.revokeObjectURL(old.blobUrl);
                 }
-                // Move key to end of order (most recently used)
-                const idx = order.indexOf(key);
-                if (idx !== -1) {
-                    order.splice(idx, 1);
-                }
-            } else {
-                // Evict oldest frames if at capacity
-                while (order.length >= this.maxFramesPerVideo) {
-                    const oldestKey = order.shift();
-                    const oldFrame = cache.get(oldestKey);
-                    if (oldFrame && oldFrame.blobUrl) {
-                        URL.revokeObjectURL(oldFrame.blobUrl);
-                    }
-                    cache.delete(oldestKey);
-                }
             }
-
             cache.set(key, imageData);
-            order.push(key);
         }
 
         hasVideo(videoSrc) {
@@ -121,7 +98,6 @@
                 }
             }
             this.caches.clear();
-            this.frameOrder.clear();
             this.videoOrder = [];
         }
 
@@ -134,8 +110,11 @@
         }
     }
 
-    // Global shared cache for all instances (5 videos, unlimited frames)
-    const globalCache = new MultiVideoCache(5);
+    // Global shared cache for all instances (20 videos, unlimited frames)
+    // v1.4.1: 5→20 に拡大。同一セッションで動画を行き来した際の再デコードを避ける。
+    // 20超は既存LRUが最古から revokeObjectURL で破棄（スライディング上書き）。
+    // サムネは160×90 JPEG(0.8)≒数KB／枚。長尺(2.5h)でも1動画≒10MB、20本フルでも約200MB上限。
+    const globalCache = new MultiVideoCache(20);
 
     // ==========================================
     // VAM Seek Main Class
@@ -165,7 +144,7 @@
             this._captureCtx = this._captureCanvas.getContext('2d');
 
             // Parallel extraction settings (default 1 for sequential processing)
-            this.parallelExtractors = options.parallelExtractors || 1;
+            this.parallelExtractors = options.parallelExtractors || 4;
 
             this.state = {
                 rows: 0,
@@ -179,8 +158,6 @@
                 markerY: 0,
                 targetX: 0,
                 targetY: 0,
-                currentCellX: 0,  // Current cell column (for keyboard navigation)
-                currentCellY: 0,  // Current cell row (for keyboard navigation)
                 isDragging: false,
                 isAnimating: false,
                 animationId: null,
@@ -283,7 +260,8 @@
                         this._scrollToMarker();
                     }
                 },
-                onKeyDown: (e) => this._onKeyDown(e)
+                onKeyDown: (e) => this._onKeyDown(e),
+                onWheel: (e) => this._onCtrlWheel(e)
             };
 
             // Video time update - now only handles auto-scroll (v1.3.1)
@@ -305,6 +283,9 @@
 
             // Keyboard
             document.addEventListener('keydown', this._boundHandlers.onKeyDown);
+
+            // Ctrl+wheel fast seek (hidden dev shortcut)
+            this.video.addEventListener('wheel', this._boundHandlers.onWheel, { passive: false });
 
             // Resize observer - update grid dimensions when container size changes
             this.resizeObserver = new ResizeObserver(() => {
@@ -421,10 +402,6 @@
                 col = lastIndex % this.columns;
             }
 
-            // Update internal cell state (for keyboard navigation)
-            this.state.currentCellX = col;
-            this.state.currentCellY = row;
-
             // Calculate cell center position (gap-aware, same as demo)
             const gap = this.state.gridGap || 2;
             const x = col * this.state.cellWidth + col * gap + this.state.cellWidth / 2;  // Cell center X
@@ -462,6 +439,51 @@
         }
 
         /**
+         * V7.5: Mark cells as critical with visual overlay
+         * @param {Array} criticalCells - Array of {index, reason} from detectCriticalCells()
+         */
+        markCriticalCells(criticalCells) {
+            if (!criticalCells || criticalCells.length === 0) return;
+
+            // First, clear any existing critical markers
+            this.clearCriticalMarkers();
+
+            for (const cell of criticalCells) {
+                const cellElement = this.grid.querySelector(`[data-index="${cell.index}"]`);
+                if (cellElement) {
+                    cellElement.classList.add('critical');
+
+                    // Set data attributes for CSS styling
+                    const reasons = Array.isArray(cell.reason) ? cell.reason : [cell.reason];
+                    cellElement.dataset.criticalReason = reasons.join(' ');
+
+                    // Set badge text (first letter of each reason)
+                    const badge = reasons.map(r => {
+                        if (r === 'loud') return '🔊';
+                        if (r === 'fast_motion') return '⚡';
+                        if (r === 'sudden_change') return '⚠';
+                        return '';
+                    }).join('');
+                    cellElement.dataset.criticalBadge = badge;
+                }
+            }
+
+            console.log(`[VAMSeek] Marked ${criticalCells.length} critical cells`);
+        }
+
+        /**
+         * V7.5: Clear all critical cell markers
+         */
+        clearCriticalMarkers() {
+            const markedCells = this.grid.querySelectorAll('.vam-cell.critical');
+            for (const cell of markedCells) {
+                cell.classList.remove('critical');
+                delete cell.dataset.criticalReason;
+                delete cell.dataset.criticalBadge;
+            }
+        }
+
+        /**
          * Destroy instance
          */
         destroy() {
@@ -490,6 +512,7 @@
                 document.removeEventListener('mousemove', this._boundHandlers.onMouseMove);
                 document.removeEventListener('mouseup', this._boundHandlers.onMouseUp);
                 document.removeEventListener('keydown', this._boundHandlers.onKeyDown);
+                this.video.removeEventListener('wheel', this._boundHandlers.onWheel);
                 // Grid event listeners are removed when grid is removed from DOM
                 this._boundHandlers = null;
             }
@@ -714,15 +737,22 @@
                     );
                 }
 
-                // Phase 2: Remaining cells in background
+                // Phase 2: Remaining cells in background.
+                // 全残りを一気に4分割すると4本のワーカーがグリッド全域に散らばり、
+                // スクロール先がなかなか埋まらない。→ スクロール位置に近い順のチャンクに分け、
+                // 近いチャンクから逐次（チャンク内は4並列）で消化する。v1.4.0
                 if (remainingIndices.length > 0 && isTaskValid()) {
-                    await this._extractCellsByIndices(
-                        this.state.extractorVideos,
-                        remainingIndices,
-                        cells,
-                        targetVideoUrl,
-                        isTaskValid
-                    );
+                    const chunks = this._buildProximityChunks(remainingIndices);
+                    for (const chunk of chunks) {
+                        if (!isTaskValid()) break;
+                        await this._extractCellsByIndices(
+                            this.state.extractorVideos,
+                            chunk,
+                            cells,
+                            targetVideoUrl,
+                            isTaskValid
+                        );
+                    }
                 }
 
             } catch (e) {
@@ -756,6 +786,41 @@
                 }
             }
             return indices;
+        }
+
+        /**
+         * Phase2用: 残りセルを「現在のスクロール位置に近い行順」でチャンク分割する。
+         * 各チャンクは _extractCellsByIndices で4並列消化される。近いチャンクから逐次流すことで
+         * 「画面外でも、今見ている位置の近くから埋まる」体感にする（全体4分割の散らばりを解消）。v1.4.0
+         */
+        _buildProximityChunks(remainingIndices) {
+            if (remainingIndices.length === 0) return [];
+
+            // 現在の可視中心の行を基準にする
+            const containerRect = this.container.getBoundingClientRect();
+            const scrollTop = this.container.scrollTop;
+            const cellHeight = this.state.cellHeight + (this.state.gridGap || 2);
+            const viewportRows = Math.max(1, Math.ceil(containerRect.height / cellHeight));
+            const centerRow = Math.floor((scrollTop + containerRect.height / 2) / cellHeight);
+
+            // 残りインデックスを行距離が近い順にソート（同距離は元順＝左上優先）
+            const sorted = remainingIndices.slice().sort((a, b) => {
+                const rowA = Math.floor(a / this.columns);
+                const rowB = Math.floor(b / this.columns);
+                const dA = Math.abs(rowA - centerRow);
+                const dB = Math.abs(rowB - centerRow);
+                return dA !== dB ? dA - dB : a - b;
+            });
+
+            // チャンクサイズ＝可視行の約1.5枚ぶん（はしくんの「20列の4分割」感覚に対応）
+            const chunkRows = Math.max(2, Math.ceil(viewportRows * 1.5));
+            const chunkSize = Math.max(this.columns, chunkRows * this.columns);
+
+            const chunks = [];
+            for (let i = 0; i < sorted.length; i += chunkSize) {
+                chunks.push(sorted.slice(i, i + chunkSize));
+            }
+            return chunks;
         }
 
         /**
@@ -948,9 +1013,6 @@
             this.state.markerY = this.state.cellHeight / 2;
             this.state.targetX = this.state.markerX;
             this.state.targetY = this.state.markerY;
-            // Initialize internal cell state
-            this.state.currentCellX = 0;
-            this.state.currentCellY = 0;
             this._updateMarkerPosition();
         }
 
@@ -1139,12 +1201,6 @@
                 if (!this.video.paused && !this.state.isDragging && this.state.totalCells > 0) {
                     const pos = this._calculatePositionFromTime(this.video.currentTime);
                     this._moveMarkerTo(pos.x, pos.y, true);
-                    // Sync internal cell state during playback
-                    const gap = this.state.gridGap || 2;
-                    const cellPlusGapX = this.state.cellWidth + gap;
-                    const cellPlusGapY = this.state.cellHeight + gap;
-                    this.state.currentCellX = Math.max(0, Math.min(Math.floor(pos.x / cellPlusGapX), this.columns - 1));
-                    this.state.currentCellY = Math.max(0, Math.min(Math.floor(pos.y / cellPlusGapY), this.state.rows - 1));
                 }
             }, 16);
         }
@@ -1193,17 +1249,11 @@
                 this.state.isDragging = false;
                 // Snap marker Y position to cell center (keep X position as is)
                 const gap = this.state.gridGap || 2;
-                const cellPlusGapX = this.state.cellWidth + gap;
                 const cellPlusGapY = this.state.cellHeight + gap;
-                const xAdjusted = this.state.markerX - this.state.cellWidth / 2;
                 const yAdjusted = this.state.markerY - this.state.cellHeight / 2;
-                const col = Math.max(0, Math.min(Math.round(xAdjusted / cellPlusGapX), this.columns - 1));
                 const row = Math.max(0, Math.min(Math.round(yAdjusted / cellPlusGapY), this.state.rows - 1));
                 const snappedY = row * cellPlusGapY + this.state.cellHeight / 2;
                 this._moveMarkerTo(this.state.markerX, snappedY, true);
-                // Update internal cell state
-                this.state.currentCellX = col;
-                this.state.currentCellY = row;
                 this._scrollToMarker();
             }
         }
@@ -1230,9 +1280,9 @@
         _onKeyDown(e) {
             if (!this.video.duration) return;
 
-            // Use internal state instead of getCurrentCell() to avoid video.currentTime sync issues
-            let col = this.state.currentCellX;
-            let row = this.state.currentCellY;
+            const cell = this.getCurrentCell();
+            let col = cell.col;
+            let row = cell.row;
 
             switch (e.key) {
                 case 'ArrowLeft':
@@ -1266,6 +1316,17 @@
 
             e.preventDefault();
             this.moveToCell(col, row);
+        }
+
+        // Ctrl+wheel fast seek (hidden dev shortcut)
+        _onCtrlWheel(e) {
+            if (!e.ctrlKey || !this.video.duration) return;
+            e.preventDefault();
+            const seekStep = 5; // seconds per wheel tick
+            const direction = e.deltaY > 0 ? 1 : -1;
+            const newTime = this.video.currentTime + (direction * seekStep);
+            this.seekTo(Math.max(0, Math.min(newTime, this.video.duration)));
+            this._scrollToMarker();
         }
 
         // ==========================================
@@ -1334,7 +1395,7 @@
         /**
          * Library version
          */
-        version: '1.3.6'
+        version: '1.4.0'
     };
 
 })(typeof window !== 'undefined' ? window : this);
